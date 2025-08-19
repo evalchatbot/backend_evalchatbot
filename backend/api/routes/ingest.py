@@ -1,18 +1,32 @@
 """
 API route for document ingestion and chunk upload.
 """
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
 from pydantic import BaseModel
-from typing import Optional
 from backend.db.supabase_client import SupabaseDB
-from ingest.document_processor import DocumentProcessor
 import os
 import shutil
+from backend.db.supabase_service import SupabaseService
+from backend.ingest.document_processor import DocumentProcessor
+import uuid
+import tempfile
 
-router = APIRouter(prefix="/ingest", tags=["ingest"])
+router = APIRouter(prefix="/api/documents", tags=["documents"])
 
-db = SupabaseDB()
-processor = DocumentProcessor()
+
+# Dependency injection
+def get_document_processor():
+    return DocumentProcessor()
+
+
+def get_supabase_service():
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")  # Use service role for admin operations
+
+    if not all([supabase_url, supabase_key]):
+        raise HTTPException(status_code=500, detail="Missing required environment variables")
+
+    return SupabaseService(supabase_url, supabase_key)
 
 class IngestResponse(BaseModel):
     book_id: str
@@ -21,35 +35,69 @@ class IngestResponse(BaseModel):
 
 @router.post("/upload", response_model=IngestResponse)
 async def upload_document(
-    file: UploadFile = File(...),
-    title: str = Form(...),
-    author: Optional[str] = Form(None),
-    genre: str = Form(...)
+        file: UploadFile = File(...),
+        title: str = None,
+        author: str = None,
+        genre: str = None,
+        document_processor: DocumentProcessor = Depends(get_document_processor),
+        supabase_service: SupabaseService = Depends(get_supabase_service)
 ):
-    """Upload a PDF, process it, and store book/chunks in Supabase."""
+    """
+    Ingest a PDF document into the system
+    """
     try:
-        # Save uploaded file to temp location
-        temp_path = f"/tmp/{file.filename}"
+        # Validate file type
+        if not file.filename.lower().endswith('.pdf'):
+            raise HTTPException(status_code=400, detail="Only PDF files are supported")
+
+        # Save uploaded file to a temp location
+        temp_dir = tempfile.gettempdir()
+        temp_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{file.filename}")
         with open(temp_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        # Insert book metadata
-        book_id = str(os.urandom(8).hex())
-        db.insert("books", {
-            "id": book_id,
-            "title": title,
-            "author": author,
-            "genre": genre,
-            "file_url": temp_path
-        })
+
         # Process document
-        chunks = processor.process_document(temp_path)
-        chunks = processor.generate_embeddings(chunks)
-        ready_chunks = processor.prepare_chunks_for_db(chunks, book_id, genre)
-        # Upload chunks
-        for chunk in ready_chunks:
-            db.insert("document_chunks", chunk)
-        # Clean up temp file
-        os.remove(temp_path)
-        return IngestResponse(book_id=book_id, num_chunks=len(ready_chunks), message="Document processed and uploaded successfully.")
+        chunks = document_processor.process_document(temp_path)
+
+        if not chunks:
+            raise HTTPException(status_code=500, detail="Failed to process document")
+
+        # Create book record
+        book_data = {
+            "title": title or file.filename.replace('.pdf', ''),
+            "author": author or "Unknown Author",
+            "genre": genre or "other",
+            # Remove file_path from book_data if not needed in DB
+            "total_pages": max(chunk["page_end"] for chunk in chunks) if chunks else 0
+        }
+
+        book = await supabase_service.create_book(book_data)
+
+        if not book:
+            raise HTTPException(status_code=500, detail="Failed to create book record")
+
+        # Add book_id to chunks
+        for chunk in chunks:
+            chunk["book_id"] = book["id"]
+
+        # Store chunks in database
+        stored_chunks = await supabase_service.create_chunks(chunks)
+
+        if not stored_chunks:
+            raise HTTPException(status_code=500, detail="Failed to store document chunks")
+
+        return {
+            "message": "Document ingested successfully",
+            "book": book,
+            "chunks_created": len(stored_chunks),
+            "total_pages": book_data["total_pages"]
+        }
+
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing document: {e}")
+        raise HTTPException(status_code=500, detail=f"Error ingesting document: {str(e)}")
+    finally:
+        # Clean up uploaded temp file
+        if 'temp_path' in locals() and os.path.exists(temp_path):
+            os.remove(temp_path)
