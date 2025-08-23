@@ -88,11 +88,9 @@ async def upload_document(
 
         return {
             "message": "Document ingested successfully",
-            "book": book,
-            "chunks_created": len(stored_chunks),
-            "total_pages": book_data["total_pages"]
+            "book_id": book["id"],
+            "num_chunks": len(stored_chunks),
         }
-
     except HTTPException:
         raise
     except Exception as e:

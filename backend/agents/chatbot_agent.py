@@ -10,6 +10,8 @@ from backend.config import GROQ_API_KEY, CHATBOT_LLM_MODEL
 from backend.rag.embedding import FastEmbedEmbedding
 from backend.rag.context import create_context_from_chunks
 import httpx
+import logging
+import os
 
 class ChatbotAgent:
     """
@@ -22,6 +24,7 @@ class ChatbotAgent:
         self.llm_model = CHATBOT_LLM_MODEL
         self.groq_api_key = GROQ_API_KEY
         self.embedding = FastEmbedEmbedding()
+        self.logger = logging.getLogger(__name__)
 
     async def ask(
         self,
@@ -35,48 +38,64 @@ class ChatbotAgent:
         Process a user question with RAG, memory, and vector search (async).
         Returns answer, source snippets, and retrieval metadata.
         """
-        # 1. Generate query embedding
-        query_embedding = await self.embedding.generate(question)
-        # 2. Get book_ids (if not provided, fetch by genre)
-        if not book_ids:
-            books_res = self.db.select("books", {"genre": genre})
-            book_ids = [b["id"] for b in books_res.data] if hasattr(books_res, 'data') else []
-        # 3. Retrieve relevant document chunks (async vector search)
-        chunks = await self.db.search_chunks_vector(query_embedding, book_ids, top_k=5)
-        # 4. Add book titles to chunks (optional, can be optimized)
-        if chunks:
-            unique_book_ids = list(set(chunk["book_id"] for chunk in chunks))
-            books_data = self.db.select("books", {"id": unique_book_ids})
-            book_map = {book["id"]: book for book in books_data.data} if hasattr(books_data, 'data') else {}
-            for chunk in chunks:
-                book = book_map.get(chunk["book_id"])
-                if book:
-                    chunk["book_title"] = book["title"]
-                    chunk["book_author"] = book["author"]
-        # 5. Create context from chunks
-        context_str = create_context_from_chunks(chunks)
-        # 6. Get recent chat context from short-term memory
-        context = self.short_term.get_recent_messages(user_id, session_id)
-        # 7. Compose prompt for LLM
-        prompt = self._compose_prompt(question, context, context_str)
-        # 8. Get answer from LLM (GROQ API)
-        answer = self._call_llm_groq(prompt)
-        # 9. Optionally persist important facts to long-term memory
-        self.long_term.save_fact(user_id, session_id, context="chat", fact=answer)
-        # 10. Add user/assistant messages to short-term memory
-        self.short_term.add_message(user_id, session_id, {"sender": "user", "message": question})
-        self.short_term.add_message(user_id, session_id, {"sender": "assistant", "message": answer})
-        return {
-            "answer": answer,
-            "sources": chunks,
-            "context": context,
-            "metadata": {"retrieved_chunks": len(chunks)}
-        }
+        self.logger.info(f"Received question from user_id={user_id}, session_id={session_id}, genre={genre}")
+        try:
+            # 1. Generate query embedding
+            query_embedding = await self.embedding.generate(question)
+            self.logger.debug(f"Generated query embedding: {query_embedding}")
+            # 2. Get book_ids (if not provided, fetch by genre)
+            if not book_ids:
+                books_res = self.db.select("books", {"genre": genre})
+                book_ids = [b["id"] for b in books_res.data] if hasattr(books_res, 'data') else []
+                self.logger.info(f"Fetched book_ids by genre: {book_ids}")
+            # 3. Retrieve relevant document chunks (async vector search)
+            chunks = await self.db.search_chunks_vector(query_embedding, book_ids, top_k=5)
+            self.logger.info(f"Retrieved {len(chunks)} relevant document chunks")
+            # 4. Add book titles to chunks (optional, can be optimized)
+            if chunks:
+                unique_book_ids = list(set(chunk["book_id"] for chunk in chunks))
+                books_data = self.db.select("books", {"id": unique_book_ids})
+                book_map = {book["id"]: book for book in books_data.data} if hasattr(books_data, 'data') else {}
+                for chunk in chunks:
+                    book = book_map.get(chunk["book_id"])
+                    if book:
+                        chunk["book_title"] = book["title"]
+                        chunk["book_author"] = book["author"]
+            # 5. Create context from chunks
+            context_str = create_context_from_chunks(chunks)
+            # 6. Get recent chat context from short-term memory
+            context = self.short_term.get_recent_messages(user_id, session_id)
+            self.logger.debug(f"Short-term memory context: {context}")
+            # 7. Compose prompt for LLM
+            prompt = self._compose_prompt(question, context, context_str)
+            # 8. Get answer from LLM (GROQ API)
+            answer = self._call_llm_groq(prompt)
+            self.logger.info(f"LLM answer: {answer}")
+            # 9. Optionally persist important facts to long-term memory
+            self.long_term.save_fact(user_id, session_id, context="chat", fact=answer)
+            # 10. Add user/assistant messages to short-term memory
+            self.short_term.add_message(user_id, session_id, {"sender": "user", "message": question})
+            self.short_term.add_message(user_id, session_id, {"sender": "assistant", "message": answer})
+            return {
+                "answer": answer,
+                "sources": chunks,
+                "context": context,
+                "metadata": {"retrieved_chunks": len(chunks)}
+            }
+        except Exception as e:
+            self.logger.error(f"Error in ChatbotAgent.ask: {e}")
+            raise
 
     def _compose_prompt(self, question: str, chat_context: List[dict], context_str: str) -> str:
         """Compose prompt for LLM using chat history and retrieved chunks."""
+        prompt_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '..', 'prompts', 'chatbot.txt')
+        try:
+            with open(prompt_path, 'r', encoding='utf-8') as f:
+                system_prompt = f.read().strip()
+        except Exception:
+            system_prompt = "System: You are a helpful book assistant."
         chat_history = "\n".join([m["message"] for m in chat_context])
-        return f"System: You are a helpful book assistant.\nChat History:\n{chat_history}\n\nRelevant Book Context:\n{context_str}\n\nQuestion: {question}\nAnswer:"
+        return f"{system_prompt}\nChat History:\n{chat_history}\n\nRelevant Book Context:\n{context_str}\n\nQuestion: {question}\nAnswer:"
 
     def _call_llm_groq(self, prompt: str) -> str:
         """Call the GROQ API to get an answer from the configured LLM model."""

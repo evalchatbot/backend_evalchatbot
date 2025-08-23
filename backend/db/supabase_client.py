@@ -21,7 +21,10 @@ class SupabaseDB:
         query = self.client.table(table).select("*")
         if filters:
             for k, v in filters.items():
-                query = query.eq(k, v)
+                if isinstance(v, list):
+                    query = query.in_(k, v)
+                else:
+                    query = query.eq(k, v)
         return query.execute()
 
     def update(self, table: str, filters: Dict[str, Any], data: Dict[str, Any]) -> Any:
