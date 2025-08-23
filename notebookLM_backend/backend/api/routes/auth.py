@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from fastapi import HTTPException, Request
 from jose import jwt, JWTError
-from backend.config import SUPABASE_JWT_SECRET, SUPABASE_ISSUER, SUPABASE_AUDIENCE
+from notebookLM_backend.backend.config import  SUPABASE_JWT_SECRET, SUPABASE_ISSUER, SUPABASE_AUDIENCE
 
 @dataclass
 class AuthUser:
