@@ -1,5 +1,6 @@
 import { api } from './http';
 import { useAuthStore } from '../store/auth';
+import { supabase } from '../lib/supabase';
 
 export async function getGenres() {
   return api.get('books/genres').json();
@@ -9,8 +10,15 @@ export async function getBooksByGenre(genre) {
 }
 
 export async function createSession() {
-  return api.post('user/session/create').json();
+  // (Optional) read current user id for the body; server will still trust token.sub
+  const { data: { user } } = await supabase.auth.getUser();
+  const user_id = user?.id ?? undefined;
+
+  return api.post('user/session/create', {
+    json: { user_id }, // or {} if you don’t want to pass it
+  }).json();
 }
+
 
 export async function askChat({ session_id, question, genre }) {
   return api.post('chatbot/ask', { json: { session_id, question, genre } }).json();

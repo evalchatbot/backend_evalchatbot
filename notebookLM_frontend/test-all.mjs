@@ -66,6 +66,10 @@ function log(title, data) {
   const req = reqFactory(token);
   console.log('✓ Signed in. user:', userId);
 
+  // 👇 Add this
+console.log("\n=== Supabase Access Token (Bearer) ===");
+console.log("Bearer " + token); // full token, or slice(0, 40) + "..." if you want truncation
+
   // 1) Books: genres
   const genres = await req('GET', '/books/genres');
   log('Books/genres', genres);
@@ -102,9 +106,12 @@ function log(title, data) {
     console.warn(`(!) Books/${chosenGenre} failed:`, e.message);
   }
 
-  // 4) User session: create (no body)
-  const session = await req('POST', '/user/session/create');
-  log('User/session/create', session);
+    const session = await req('POST', '/user/session/create', {
+      user_id: userId,              // from Supabase sign-in above
+      // you can add more fields later if you extend your model, e.g. device info
+      // device: "win10-edge-139",
+    });
+    log('User/session/create', session);
 
   // 5) Chatbot: ask
   try {

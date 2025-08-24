@@ -2,13 +2,19 @@
 Chatbot Agent module.
 Handles RAG pipeline, vector search, and memory management (short-term and long-term).
 """
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from backend.memory.short_term import ShortTermMemory
 from backend.memory.long_term import LongTermMemory
 from backend.db.supabase_client import SupabaseDB
 from backend.config import GROQ_API_KEY, CHATBOT_LLM_MODEL
 from backend.rag.embedding import FastEmbedEmbedding
 from backend.rag.context import create_context_from_chunks
+from backend.rag.llm.groq_httpx import GroqHTTPxLLM
+from backend.rag.reasoning.graph_controller import run_controller
+from backend.rag.adapters.supabase_store import SupabaseVectorStoreAdapter
+from backend.rag.retrieval.hybrid_retriever import HybridRetriever
+from backend.rag.models.schemas import Citation
+
 import httpx
 import logging
 import os
@@ -123,3 +129,125 @@ class ChatbotAgent:
                 return data["choices"][0]["message"]["content"]
         except Exception as e:
             return f"[GROQ API error: {e}]"
+
+    async def ask_multi_step(
+            self,
+            user_id: str,
+            session_id: str,
+            question: str,
+            genre: str,
+            book_ids: Optional[List[str]] = None,
+            max_iterations: int = 3,
+    ) -> Dict[str, Any]:
+        """
+        Multi-step RAG pipeline:
+          - builds messages from short-term memory
+          - narrows retrieval by book_ids (or resolves from genre)
+          - runs plan → retrieve → validate → synthesize
+          - stores memories and returns answer + resolved sources
+        """
+        self.logger.info(f"[multi-step] user_id={user_id} session_id={session_id} genre={genre}")
+
+        # 0) Build chat history → messages[{role, content}]
+        history = self.short_term.get_recent_messages(user_id, session_id)  # your structure: {"sender","message"}
+        messages: List[Dict[str, str]] = []
+        for m in history:
+            role = "assistant" if m.get("sender") == "assistant" else "user"
+            content = str(m.get("message", "")).strip()
+            if content:
+                messages.append({"role": role, "content": content})
+        # Append the current user question as the last message
+        messages.append({"role": "user", "content": question.strip()})
+
+        # 1) Resolve filters: book_ids (or by genre)
+        if not book_ids:
+            # your DB select wrapper – same logic as your existing ask(...)
+            try:
+                books_res = self.db.select("books", {"genre": genre})
+                book_ids = [b["id"] for b in getattr(books_res, "data", [])]
+            except Exception as e:
+                self.logger.warning(f"[multi-step] failed to fetch books by genre: {e}")
+                book_ids = []
+        selection_filters = {"book_ids": book_ids or []}
+
+        # 2) Build retriever that wraps your Supabase DB (reuses your RPC)
+        adapter = SupabaseVectorStoreAdapter(self.db)  # expects .search_chunks_vector and .supabase
+        retriever = HybridRetriever(adapter)
+
+        # 3) Async LLM client for planner + synthesizer
+        llm = GroqHTTPxLLM(api_key=self.groq_api_key, model=self.llm_model)
+
+        # 4) Run controller
+        result = await run_controller(
+            messages=messages,
+            selection_filters=selection_filters,
+            max_iterations=max_iterations,
+            llm_client=llm,
+            retriever=retriever,  # supply explicitly to avoid lazy import differences
+            planner=None,  # controller will instantiate planner with llm
+        )
+
+        answer: str = result.get("answer", "")
+        citations: List[Citation] = result.get("citations", [])
+        traces = result.get("traces", [])
+        iterations = result.get("iterations", 0)
+
+        # 5) Resolve source chunks from citations (by chunk_id) for UI parity with your current return shape
+        sources = await self._resolve_sources_from_citations(citations)
+
+        # 6) Memory updates (like your ask())
+        try:
+            self.long_term.save_fact(user_id, session_id, context="chat", fact=answer)
+        except Exception as e:
+            self.logger.warning(f"[multi-step] long-term memory save failed: {e}")
+
+        self.short_term.add_message(user_id, session_id, {"sender": "user", "message": question})
+        self.short_term.add_message(user_id, session_id, {"sender": "assistant", "message": answer})
+
+        return {
+            "answer": answer,
+            "sources": sources,  # resolved chunks if available
+            "traces": [t.dict() for t in traces],
+            "metadata": {"iterations": iterations, "book_ids": selection_filters["book_ids"]},
+        }
+
+    async def _resolve_sources_from_citations(self, citations: List[Citation]) -> List[Dict[str, Any]]:
+        """
+        Given citations (doc_id/book_id + chunk_id), fetch the chunk rows from Supabase
+        so your UI gets the same 'sources' structure it expects.
+        """
+        if not citations:
+            return []
+        # Collect chunk_ids
+        chunk_ids = list({c.chunk_id for c in citations if getattr(c, "chunk_id", None)})
+        if not chunk_ids:
+            return []
+
+        # Use the underlying supabase client directly to fetch chunks by id
+        try:
+            rows = (
+                       self.db.supabase.table("document_chunks")
+                       .select("*")
+                       .in_("id", chunk_ids)
+                       .execute()
+                       .data
+                   ) or []
+        except Exception as e:
+            self.logger.warning(f"[multi-step] fetch sources by chunk_ids failed: {e}")
+            rows = []
+
+        # Optionally enrich with book title/author (like your current ask())
+        if rows:
+            uniq_book_ids = list({r.get("book_id") for r in rows if r.get("book_id")})
+            try:
+                books_data = self.db.select("books", {"id": uniq_book_ids})
+                book_map = {b["id"]: b for b in getattr(books_data, "data", [])}
+                for r in rows:
+                    b = book_map.get(r.get("book_id"))
+                    if b:
+                        r["book_title"] = b.get("title")
+                        r["book_author"] = b.get("author")
+            except Exception:
+                pass
+
+        return rows
